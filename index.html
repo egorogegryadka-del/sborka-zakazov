@@ -1,0 +1,807 @@
+<div id="app-root"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
+<style>
+#app-root, #app-root * { box-sizing: border-box; }
+#app-root {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: #15171a;
+  color: #eef0f2;
+  min-height: 100vh;
+  width: 100%;
+}
+.mono { font-family: "SF Mono", "Roboto Mono", Consolas, monospace; }
+.btn {
+  background: #2a2d33;
+  color: #eef0f2;
+  border: 1px solid #3c4047;
+  border-radius: 10px;
+  padding: 14px 20px;
+  font-size: 16px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background .12s, transform .08s;
+}
+.btn:hover { background: #34383f; }
+.btn:active { transform: scale(0.98); }
+.btn-primary { background: #d68a1f; color: #1a1402; border-color: #d68a1f; }
+.btn-primary:hover { background: #e69a2a; }
+.btn-danger { background: #3a1d1d; color: #ff9a9a; border-color: #5c2a2a; }
+.btn-ghost { background: transparent; border-color: #3c4047; }
+input[type=text], input[type=file] {
+  background: #1d2024;
+  border: 1px solid #3c4047;
+  border-radius: 10px;
+  color: #eef0f2;
+  padding: 14px 16px;
+  font-size: 18px;
+  width: 100%;
+}
+input[type=text]:focus { outline: 2px solid #d68a1f; border-color: #d68a1f; }
+::placeholder { color: #6b6f76; }
+.card {
+  background: #1d2024;
+  border: 1px solid #2c3036;
+  border-radius: 14px;
+  padding: 20px;
+}
+.scrollbar::-webkit-scrollbar { width: 8px; }
+.scrollbar::-webkit-scrollbar-thumb { background: #3c4047; border-radius: 4px; }
+@keyframes flashGreen { 0% { background: #1d2024; } 15% { background: #1d4d2c; } 100% { background: #1d2024; } }
+@keyframes flashRed { 0% { background: #1d2024; } 15% { background: #5c1d1d; } 100% { background: #1d2024; } }
+.flash-ok { animation: flashGreen 0.6s ease-out; }
+.flash-err { animation: flashRed 0.6s ease-out; }
+</style>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+const STORAGE_KEYS = {
+  orders: 'orders-data',
+  barcodes: 'barcode-map',
+  progress: 'pick-progress',
+  labelScanMap: 'label-scan-map',
+};
+
+function useStorage() {
+  const get = useCallback(async (key, shared) => {
+    try {
+      const res = await window.storage.get(key, shared);
+      return res ? JSON.parse(res.value) : null;
+    } catch (e) {
+      return null;
+    }
+  }, []);
+  const set = useCallback(async (key, value, shared) => {
+    try {
+      await window.storage.set(key, JSON.stringify(value), shared);
+      return true;
+    } catch (e) {
+      console.error('storage set failed', e);
+      return false;
+    }
+  }, []);
+  return { get, set };
+}
+
+// ---------- PDF parsing ----------
+async function parseOrdersPdf(file) {
+  const buf = await file.arrayBuffer();
+  pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+  const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+
+  const orders = [];
+  let currentWarehouse = null;
+
+  for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+    const page = await pdf.getPage(pageNum);
+    const content = await page.getTextContent();
+
+    // group items by rounded 'top' (pdf.js gives transform[5] as y from bottom; convert to top-ish using viewport height)
+    const viewport = page.getViewport({ scale: 1 });
+    const items = content.items.map(it => ({
+      text: it.str,
+      x0: it.transform[4],
+      top: Math.round((viewport.height - it.transform[5]) * 2) / 2,
+    })).filter(it => it.text.trim().length > 0);
+
+    // detect warehouse name: scan items in order for 'Склад:' marker, take following items until 'Служба'
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].text === 'Склад:') {
+        let parts = [];
+        let j = i + 1;
+        while (j < items.length && items[j].text !== 'Служба') {
+          parts.push(items[j].text);
+          j++;
+        }
+        currentWarehouse = parts.join(' ').trim();
+        break;
+      }
+    }
+
+    // group into lines
+    const lineMap = new Map();
+    for (const it of items) {
+      const key = it.top;
+      if (!lineMap.has(key)) lineMap.set(key, []);
+      lineMap.get(key).push(it);
+    }
+    const tops = Array.from(lineMap.keys()).sort((a, b) => a - b);
+    for (const t of tops) lineMap.get(t).sort((a, b) => a.x0 - b.x0);
+
+    // find row starts: row-number at x0 in [25,42], next word is shipment number pattern at x0 in [42,52]
+    const shipRe = /^\d{6,}-\d+-\d+$/;
+    const rowStarts = [];
+    tops.forEach((top, idx) => {
+      const ws = lineMap.get(top);
+      for (let i = 0; i < ws.length; i++) {
+        const w = ws[i];
+        if (w.x0 >= 25 && w.x0 <= 42 && /^\d+$/.test(w.text.trim())) {
+          const next = ws[i + 1];
+          if (next && next.x0 >= 42 && next.x0 <= 53 && shipRe.test(next.text.trim())) {
+            rowStarts.push({ idx, top, shipNum: next.text.trim() });
+            break;
+          }
+        }
+      }
+    });
+
+    rowStarts.forEach((row, ri) => {
+      const windowStart = row.top - 7;
+      const windowEnd = ri + 1 < rowStarts.length ? rowStarts[ri + 1].top - 7 : row.top + 16;
+      const articulParts = [];
+      for (const t of tops) {
+        if (t >= windowStart && t <= windowEnd) {
+          for (const w of lineMap.get(t)) {
+            if (w.x0 >= 393 && w.x0 <= 487) {
+              articulParts.push([t, w.x0, w.text]);
+            }
+          }
+        }
+      }
+      articulParts.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+      const articul = articulParts.map(p => p[2]).join('').trim();
+      orders.push({
+        shipNumber: row.shipNum,
+        articul: articul,
+        warehouse: currentWarehouse || '—',
+      });
+    });
+  }
+
+  return orders;
+}
+
+// ---------- Labels PDF parsing (ship number <-> scan code from QR) ----------
+async function parseLabelsPdf(file, onProgress) {
+  const buf = await file.arrayBuffer();
+  pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+  const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+
+  const shipRe = /^-\d+-\d+$/;
+  const numRe = /^[\d\s]+$/;
+  const results = [];
+  const failures = [];
+
+  for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+    if (onProgress) onProgress(pageNum, pdf.numPages);
+
+    const page = await pdf.getPage(pageNum);
+
+    // 1. extract ship number from text layer.
+    // layout varies: the number before the suffix can appear as a single item with an
+    // internal space (e.g. "4334 9665"), or as several separate items (e.g. "4334" and "9665").
+    // Collect every digit-only/digit+space item, sort by vertical position, and concatenate.
+    const content = await page.getTextContent();
+    let suffix = null;
+    const numItems = [];
+    for (const item of content.items) {
+      const t = item.str.trim();
+      if (!t) continue;
+      if (shipRe.test(t)) {
+        suffix = t;
+      } else if (numRe.test(t)) {
+        numItems.push({ y: item.transform[5], text: t.replace(/\s+/g, '') });
+      }
+    }
+    if (!suffix || numItems.length === 0) {
+      failures.push({ page: pageNum, reason: 'не удалось прочитать номер отправления' });
+      continue;
+    }
+    // pdf.js y-axis points up; sort descending so the visually topmost piece comes first
+    numItems.sort((a, b) => b.y - a.y);
+    const numText = numItems.map(n => n.text).join('');
+    const shipNumber = numText + suffix;
+
+    // 2. render page to canvas at high scale, then decode QR with jsQR
+    const scale = 4;
+    const viewport = page.getViewport({ scale });
+    const canvas = document.createElement('canvas');
+    canvas.width = viewport.width;
+    canvas.height = viewport.height;
+    const ctx = canvas.getContext('2d');
+    await page.render({ canvasContext: ctx, viewport }).promise;
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+    const qrResult = jsQR(imageData.data, imageData.width, imageData.height);
+    if (!qrResult || !qrResult.data) {
+      failures.push({ page: pageNum, reason: `не удалось распознать QR-код (отправление ${shipNumber})` });
+      continue;
+    }
+
+    results.push({ shipNumber, scanCode: qrResult.data.trim() });
+  }
+
+  return { results, failures };
+}
+
+
+function parseBarcodeXlsx(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const wb = XLSX.read(e.target.result, { type: 'array' });
+        const sheet = wb.Sheets[wb.SheetNames[0]];
+        const rows = XLSX.utils.sheet_to_json(sheet, { header: 1 });
+        const map = {};
+        for (const row of rows) {
+          if (!row || row.length < 2) continue;
+          const barcode = String(row[0]).trim();
+          const articul = String(row[1]).trim();
+          if (!barcode || !articul || barcode.toLowerCase() === 'штрихкод' || barcode.toLowerCase() === 'barcode') continue;
+          map[barcode] = articul;
+        }
+        resolve(map);
+      } catch (err) {
+        reject(err);
+      }
+    };
+    reader.onerror = reject;
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+function normalize(s) {
+  return (s || '').toString().trim().toLowerCase().replace(/\s+/g, '');
+}
+
+// ---------- Main App ----------
+function App() {
+  const { get, set } = useStorage();
+  const [screen, setScreen] = useState('loading'); // loading | setup | pick
+  const [orders, setOrders] = useState([]);
+  const [barcodeMap, setBarcodeMap] = useState({});
+  const [labelScanMap, setLabelScanMap] = useState({}); // scanCode -> shipNumber
+  const [progress, setProgress] = useState({}); // shipNumber -> { done: bool, ts }
+  const [loadError, setLoadError] = useState(null);
+  const [labelParseProgress, setLabelParseProgress] = useState(null); // { page, total } | null
+  const [labelParseWarnings, setLabelParseWarnings] = useState([]);
+
+  // current pick state
+  const [scannedShip, setScannedShip] = useState(null);
+  const [shipInput, setShipInput] = useState('');
+  const [barcodeInput, setBarcodeInput] = useState('');
+  const [flash, setFlash] = useState(null); // 'ok' | 'err' | null
+  const [errMsg, setErrMsg] = useState('');
+  const [locked, setLocked] = useState(false);
+
+  const shipRef = useRef(null);
+  const barcodeRef = useRef(null);
+
+  useEffect(() => {
+    (async () => {
+      const o = await get(STORAGE_KEYS.orders, true);
+      const b = await get(STORAGE_KEYS.barcodes, true);
+      const p = await get(STORAGE_KEYS.progress, true);
+      const l = await get(STORAGE_KEYS.labelScanMap, true);
+      if (o) setOrders(o);
+      if (b) setBarcodeMap(b);
+      if (p) setProgress(p);
+      if (l) setLabelScanMap(l);
+      setScreen('setup');
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (screen === 'pick' && shipRef.current && !scannedShip) {
+      shipRef.current.focus();
+    }
+  }, [screen, scannedShip]);
+
+  useEffect(() => {
+    if (scannedShip && barcodeRef.current) {
+      barcodeRef.current.focus();
+    }
+  }, [scannedShip]);
+
+  const totalCount = orders.length;
+  const doneCount = useMemo(
+    () => orders.filter(o => progress[o.shipNumber]?.done).length,
+    [orders, progress]
+  );
+  const remaining = totalCount - doneCount;
+
+  async function handlePdfUpload(file) {
+    setLoadError(null);
+    try {
+      const parsed = await parseOrdersPdf(file);
+      if (parsed.length === 0) {
+        setLoadError('Не удалось найти заказы в файле. Проверьте формат PDF.');
+        return;
+      }
+      setOrders(parsed);
+      await set(STORAGE_KEYS.orders, parsed, true);
+      // reset progress for a fresh order list
+      setProgress({});
+      await set(STORAGE_KEYS.progress, {}, true);
+    } catch (e) {
+      console.error(e);
+      setLoadError('Ошибка чтения PDF: ' + e.message);
+    }
+  }
+
+  async function handleLabelsPdfUpload(file) {
+    setLoadError(null);
+    setLabelParseWarnings([]);
+    setLabelParseProgress({ page: 0, total: 1 });
+    try {
+      const { results, failures } = await parseLabelsPdf(file, (page, total) => {
+        setLabelParseProgress({ page, total });
+      });
+      if (results.length === 0) {
+        setLoadError('Не удалось распознать ни одной этикетки в файле.');
+        setLabelParseProgress(null);
+        return;
+      }
+      const newMap = {};
+      for (const r of results) newMap[r.scanCode] = r.shipNumber;
+      const merged = { ...labelScanMap, ...newMap };
+      setLabelScanMap(merged);
+      await set(STORAGE_KEYS.labelScanMap, merged, true);
+      setLabelParseWarnings(failures);
+    } catch (e) {
+      console.error(e);
+      setLoadError('Ошибка чтения PDF с этикетками: ' + e.message);
+    }
+    setLabelParseProgress(null);
+  }
+
+  async function handleXlsxUpload(file) {
+    setLoadError(null);
+    try {
+      const map = await parseBarcodeXlsx(file);
+      if (Object.keys(map).length === 0) {
+        setLoadError('Не удалось найти привязки в файле. Формат: колонка A — баркод, колонка B — артикул.');
+        return;
+      }
+      const merged = { ...barcodeMap, ...map };
+      setBarcodeMap(merged);
+      await set(STORAGE_KEYS.barcodes, merged, true);
+    } catch (e) {
+      console.error(e);
+      setLoadError('Ошибка чтения Excel: ' + e.message);
+    }
+  }
+
+  async function resetProgress() {
+    setProgress({});
+    await set(STORAGE_KEYS.progress, {}, true);
+  }
+
+  function findOrder(scannedValue) {
+    const val = scannedValue.trim();
+    // 1. try resolving via label scan-code map (normal flow: scanner reads QR code)
+    const shipFromScan = labelScanMap[val];
+    if (shipFromScan) {
+      return orders.find(o => o.shipNumber.trim() === shipFromScan.trim());
+    }
+    // 2. fallback: direct match against ship number text (manual entry, or if scan-code map not loaded)
+    return orders.find(o => o.shipNumber.trim() === val);
+  }
+
+  function submitShip(e) {
+    e.preventDefault();
+    const val = shipInput.trim();
+    if (!val) return;
+    const order = findOrder(val);
+    if (!order) {
+      const hint = Object.keys(labelScanMap).length === 0
+        ? ' (справочник этикеток не загружен — загрузите PDF с этикетками в настройках)'
+        : '';
+      setErrMsg(`Отправление «${val}» не найдено в списке заказов${hint}`);
+      setFlash('err');
+      setShipInput('');
+      setTimeout(() => { setFlash(null); shipRef.current?.focus(); }, 600);
+      return;
+    }
+    if (progress[order.shipNumber]?.done) {
+      setErrMsg(`Заказ «${order.shipNumber}» уже собран`);
+      setFlash('err');
+      setShipInput('');
+      setTimeout(() => { setFlash(null); shipRef.current?.focus(); }, 600);
+      return;
+    }
+    setScannedShip(order);
+    setShipInput('');
+    setErrMsg('');
+    setLocked(false);
+  }
+
+  async function submitBarcode(e) {
+    e.preventDefault();
+    const val = barcodeInput.trim();
+    if (!val || !scannedShip) return;
+
+    const mappedArticul = barcodeMap[val];
+    const orderArticul = scannedShip.articul;
+
+    const matches = mappedArticul && normalize(mappedArticul) === normalize(orderArticul);
+
+    if (matches) {
+      const newProgress = {
+        ...progress,
+        [scannedShip.shipNumber]: { done: true, ts: Date.now() },
+      };
+      setProgress(newProgress);
+      await set(STORAGE_KEYS.progress, newProgress, true);
+      setFlash('ok');
+      setBarcodeInput('');
+      setTimeout(() => {
+        setFlash(null);
+        setScannedShip(null);
+        setLocked(false);
+      }, 700);
+    } else {
+      setLocked(true);
+      setFlash('err');
+      if (!mappedArticul) {
+        setErrMsg(`Баркод «${val}» не найден в справочнике привязок`);
+      } else {
+        setErrMsg(`Не совпадает! Отсканирован товар «${mappedArticul}», а в заказе «${orderArticul}»`);
+      }
+      setBarcodeInput('');
+    }
+  }
+
+  function unlockAndRetry() {
+    setLocked(false);
+    setFlash(null);
+    setErrMsg('');
+    if (barcodeRef.current) barcodeRef.current.focus();
+  }
+
+  function cancelCurrentOrder() {
+    setScannedShip(null);
+    setLocked(false);
+    setFlash(null);
+    setErrMsg('');
+  }
+
+  if (screen === 'loading') {
+    return <div style={{ padding: '3rem', textAlign: 'center', color: '#9a9ea4' }}>Загрузка…</div>;
+  }
+
+  return (
+    <div style={{ maxWidth: 720, margin: '0 auto', padding: '1.5rem 1.25rem 3rem' }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', marginBottom: '1.25rem', flexWrap: 'wrap', gap: 8 }}>
+        <h1 style={{ fontSize: 20, fontWeight: 500, margin: 0 }}>Сборка заказов</h1>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button className="btn btn-ghost" style={{ padding: '8px 14px', fontSize: 13 }} onClick={() => setScreen(screen === 'setup' ? 'pick' : 'setup')}>
+            {screen === 'setup' ? 'К сборке' : 'Настройки'}
+          </button>
+        </div>
+      </div>
+
+      <StatusBar total={totalCount} done={doneCount} remaining={remaining} />
+
+      {screen === 'setup' && (
+        <SetupScreen
+          orders={orders}
+          barcodeMap={barcodeMap}
+          labelScanMap={labelScanMap}
+          loadError={loadError}
+          onPdfUpload={handlePdfUpload}
+          onLabelsPdfUpload={handleLabelsPdfUpload}
+          onXlsxUpload={handleXlsxUpload}
+          onReset={resetProgress}
+          onGoToPick={() => setScreen('pick')}
+          progress={progress}
+          labelParseProgress={labelParseProgress}
+          labelParseWarnings={labelParseWarnings}
+        />
+      )}
+
+      {screen === 'pick' && (
+        <PickScreen
+          scannedShip={scannedShip}
+          shipInput={shipInput}
+          setShipInput={setShipInput}
+          barcodeInput={barcodeInput}
+          setBarcodeInput={setBarcodeInput}
+          onSubmitShip={submitShip}
+          onSubmitBarcode={submitBarcode}
+          flash={flash}
+          errMsg={errMsg}
+          locked={locked}
+          onUnlock={unlockAndRetry}
+          onCancel={cancelCurrentOrder}
+          shipRef={shipRef}
+          barcodeRef={barcodeRef}
+          ordersLoaded={totalCount > 0}
+          remaining={remaining}
+        />
+      )}
+    </div>
+  );
+}
+
+function StatusBar({ total, done, remaining }) {
+  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0,1fr))', gap: 10, marginBottom: '1.5rem' }}>
+      <Metric label="Всего заказов" value={total} />
+      <Metric label="Собрано" value={done} accent="#3ea96b" />
+      <Metric label="Осталось" value={remaining} accent={remaining === 0 && total > 0 ? '#3ea96b' : '#d68a1f'} />
+      <div style={{ gridColumn: '1 / -1', height: 6, background: '#1d2024', borderRadius: 4, overflow: 'hidden' }}>
+        <div style={{ height: '100%', width: pct + '%', background: '#3ea96b', transition: 'width .3s' }} />
+      </div>
+    </div>
+  );
+}
+
+function Metric({ label, value, accent }) {
+  return (
+    <div className="card" style={{ padding: '14px 16px' }}>
+      <div style={{ fontSize: 12, color: '#9a9ea4', marginBottom: 4 }}>{label}</div>
+      <div className="mono" style={{ fontSize: 26, fontWeight: 600, color: accent || '#eef0f2' }}>{value}</div>
+    </div>
+  );
+}
+
+function SetupScreen({
+  orders, barcodeMap, labelScanMap, loadError, onPdfUpload, onLabelsPdfUpload, onXlsxUpload,
+  onReset, onGoToPick, progress, labelParseProgress, labelParseWarnings,
+}) {
+  const pdfInputRef = useRef(null);
+  const labelsInputRef = useRef(null);
+  const xlsxInputRef = useRef(null);
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+      <div className="card">
+        <h2 style={{ fontSize: 16, fontWeight: 500, margin: '0 0 4px' }}>1. Список заказов (PDF)</h2>
+        <p style={{ fontSize: 13, color: '#9a9ea4', margin: '0 0 12px' }}>
+          Загрузите сборочный лист в формате PDF — он будет считан и обновлён каждый раз при новой загрузке.
+        </p>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+          <button className="btn" onClick={() => pdfInputRef.current?.click()}>Выбрать PDF-файл</button>
+          <input ref={pdfInputRef} type="file" accept="application/pdf" style={{ display: 'none' }}
+            onChange={(e) => { const f = e.target.files[0]; if (f) onPdfUpload(f); e.target.value = ''; }} />
+          <span className="mono" style={{ fontSize: 14, color: '#9a9ea4' }}>
+            {orders.length > 0 ? `загружено заказов: ${orders.length}` : 'файл не загружен'}
+          </span>
+        </div>
+      </div>
+
+      <div className="card">
+        <h2 style={{ fontSize: 16, fontWeight: 500, margin: '0 0 4px' }}>2. Этикетки с QR-кодами (PDF)</h2>
+        <p style={{ fontSize: 13, color: '#9a9ea4', margin: '0 0 12px' }}>
+          Файл со всеми этикетками отправлений за смену — тот, что выгружается из личного кабинета Ozon.
+          Приложение само считает QR-код каждой этикетки и свяжет его с номером отправления — это и есть то,
+          что покажет сканер при сборке.
+        </p>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+          <button className="btn" onClick={() => labelsInputRef.current?.click()} disabled={!!labelParseProgress}>
+            {labelParseProgress ? 'Распознаётся…' : 'Выбрать PDF с этикетками'}
+          </button>
+          <input ref={labelsInputRef} type="file" accept="application/pdf" style={{ display: 'none' }}
+            onChange={(e) => { const f = e.target.files[0]; if (f) onLabelsPdfUpload(f); e.target.value = ''; }} />
+          <span className="mono" style={{ fontSize: 14, color: '#9a9ea4' }}>
+            {labelParseProgress
+              ? `страница ${labelParseProgress.page} из ${labelParseProgress.total}`
+              : Object.keys(labelScanMap).length > 0
+                ? `распознано этикеток: ${Object.keys(labelScanMap).length}`
+                : 'файл не загружен'}
+          </span>
+        </div>
+        {labelParseWarnings && labelParseWarnings.length > 0 && (
+          <div style={{ marginTop: 12, fontSize: 13, color: '#d68a1f' }}>
+            Не распознано страниц: {labelParseWarnings.length}.
+            <div className="scrollbar" style={{ maxHeight: 100, overflowY: 'auto', marginTop: 6 }}>
+              {labelParseWarnings.map((w, i) => (
+                <div key={i} style={{ color: '#9a9ea4' }}>стр. {w.page}: {w.reason}</div>
+              ))}
+            </div>
+          </div>
+        )}
+        {Object.keys(labelScanMap).length > 0 && (
+          <details style={{ marginTop: 12 }}>
+            <summary style={{ fontSize: 13, color: '#9a9ea4', cursor: 'pointer' }}>
+              Показать распознанные коды (для проверки)
+            </summary>
+            <div className="scrollbar" style={{ maxHeight: 200, overflowY: 'auto', marginTop: 8 }}>
+              <table style={{ width: '100%', fontSize: 12, borderCollapse: 'collapse' }}>
+                <thead>
+                  <tr style={{ color: '#9a9ea4', textAlign: 'left' }}>
+                    <th style={{ padding: '4px 6px', fontWeight: 400 }}>Код с этикетки (QR)</th>
+                    <th style={{ padding: '4px 6px', fontWeight: 400 }}>Номер отправления</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {Object.entries(labelScanMap).map(([code, ship]) => (
+                    <tr key={code} style={{ borderTop: '1px solid #2c3036' }}>
+                      <td className="mono" style={{ padding: '4px 6px' }}>{JSON.stringify(code)}</td>
+                      <td className="mono" style={{ padding: '4px 6px' }}>{ship}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </details>
+        )}
+      </div>
+
+      <div className="card">
+        <h2 style={{ fontSize: 16, fontWeight: 500, margin: '0 0 4px' }}>3. Привязка баркод → артикул (Excel)</h2>
+        <p style={{ fontSize: 13, color: '#9a9ea4', margin: '0 0 12px' }}>
+          Файл .xlsx: колонка A — баркод товара, колонка B — артикул. Загружается один раз, новые файлы добавляются к существующей привязке.
+        </p>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+          <button className="btn" onClick={() => xlsxInputRef.current?.click()}>Выбрать Excel-файл</button>
+          <input ref={xlsxInputRef} type="file" accept=".xlsx,.xls" style={{ display: 'none' }}
+            onChange={(e) => { const f = e.target.files[0]; if (f) onXlsxUpload(f); e.target.value = ''; }} />
+          <span className="mono" style={{ fontSize: 14, color: '#9a9ea4' }}>
+            {Object.keys(barcodeMap).length > 0 ? `привязок: ${Object.keys(barcodeMap).length}` : 'привязка не загружена'}
+          </span>
+        </div>
+      </div>
+
+      {loadError && (
+        <div className="card" style={{ borderColor: '#5c2a2a', background: '#241818', color: '#ff9a9a', fontSize: 14 }}>
+          {loadError}
+        </div>
+      )}
+
+      <div className="card">
+        <h2 style={{ fontSize: 16, fontWeight: 500, margin: '0 0 12px' }}>Список заказов</h2>
+        {orders.length === 0 ? (
+          <p style={{ fontSize: 14, color: '#9a9ea4', margin: 0 }}>Список пуст — загрузите PDF-файл.</p>
+        ) : (
+          <div className="scrollbar" style={{ maxHeight: 280, overflowY: 'auto' }}>
+            <table style={{ width: '100%', fontSize: 13, borderCollapse: 'collapse' }}>
+              <thead>
+                <tr style={{ color: '#9a9ea4', textAlign: 'left' }}>
+                  <th style={{ padding: '4px 8px', fontWeight: 400 }}>Отправление</th>
+                  <th style={{ padding: '4px 8px', fontWeight: 400 }}>Артикул</th>
+                  <th style={{ padding: '4px 8px', fontWeight: 400, textAlign: 'center' }}>Статус</th>
+                </tr>
+              </thead>
+              <tbody>
+                {orders.map(o => (
+                  <tr key={o.shipNumber} style={{ borderTop: '1px solid #2c3036' }}>
+                    <td className="mono" style={{ padding: '6px 8px' }}>{o.shipNumber}</td>
+                    <td style={{ padding: '6px 8px' }}>{o.articul}</td>
+                    <td style={{ padding: '6px 8px', textAlign: 'center' }}>
+                      {progress[o.shipNumber]?.done
+                        ? <span style={{ color: '#3ea96b' }}>✓ собран</span>
+                        : <span style={{ color: '#6b6f76' }}>—</span>}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+        <button className="btn btn-primary" disabled={orders.length === 0} style={orders.length === 0 ? { opacity: 0.5, cursor: 'not-allowed' } : {}} onClick={onGoToPick}>
+          Начать сборку
+        </button>
+        <button className="btn btn-danger" onClick={() => { if (confirm('Сбросить весь прогресс сборки?')) onReset(); }}>
+          Сбросить прогресс
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function PickScreen({
+  scannedShip, shipInput, setShipInput, barcodeInput, setBarcodeInput,
+  onSubmitShip, onSubmitBarcode, flash, errMsg, locked, onUnlock, onCancel,
+  shipRef, barcodeRef, ordersLoaded, remaining,
+}) {
+  if (!ordersLoaded) {
+    return (
+      <div className="card" style={{ textAlign: 'center', color: '#9a9ea4' }}>
+        Список заказов не загружен. Перейдите в настройки и загрузите PDF.
+      </div>
+    );
+  }
+
+  if (remaining === 0) {
+    return (
+      <div className="card" style={{ textAlign: 'center', padding: '3rem 1.5rem' }}>
+        <div style={{ fontSize: 40, marginBottom: 12 }}>✓</div>
+        <div style={{ fontSize: 18, fontWeight: 500, color: '#3ea96b' }}>Все заказы собраны</div>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className={flash === 'ok' ? 'card flash-ok' : flash === 'err' ? 'card flash-err' : 'card'}
+      style={{ padding: '1.5rem' }}
+    >
+      {!scannedShip && (
+        <form onSubmit={onSubmitShip}>
+          <label style={{ fontSize: 13, color: '#9a9ea4', display: 'block', marginBottom: 8 }}>
+            Отсканируйте этикетку заказа
+          </label>
+          <input
+            ref={shipRef}
+            type="text"
+            className="mono"
+            placeholder="Код с этикетки"
+            value={shipInput}
+            onChange={(e) => setShipInput(e.target.value)}
+            autoFocus
+          />
+          {errMsg && !scannedShip && (
+            <p style={{ color: '#ff9a9a', fontSize: 14, marginTop: 10 }}>{errMsg}</p>
+          )}
+        </form>
+      )}
+
+      {scannedShip && (
+        <div>
+          <div style={{ marginBottom: 16, paddingBottom: 16, borderBottom: '1px solid #2c3036' }}>
+            <div style={{ fontSize: 12, color: '#9a9ea4', marginBottom: 4 }}>Заказ</div>
+            <div className="mono" style={{ fontSize: 18, fontWeight: 600, marginBottom: 6 }}>{scannedShip.shipNumber}</div>
+            <div style={{ fontSize: 12, color: '#9a9ea4', marginBottom: 4 }}>Ожидаемый товар (артикул)</div>
+            <div style={{ fontSize: 16, fontWeight: 500 }}>{scannedShip.articul}</div>
+          </div>
+
+          {!locked ? (
+            <form onSubmit={onSubmitBarcode}>
+              <label style={{ fontSize: 13, color: '#9a9ea4', display: 'block', marginBottom: 8 }}>
+                Отсканируйте баркод товара
+              </label>
+              <input
+                ref={barcodeRef}
+                type="text"
+                className="mono"
+                placeholder="Баркод товара"
+                value={barcodeInput}
+                onChange={(e) => setBarcodeInput(e.target.value)}
+                autoFocus
+              />
+              <div style={{ marginTop: 12 }}>
+                <button type="button" className="btn btn-ghost" style={{ fontSize: 13, padding: '8px 14px' }} onClick={onCancel}>
+                  Отменить
+                </button>
+              </div>
+            </form>
+          ) : (
+            <div>
+              <div style={{ background: '#3a1d1d', border: '1px solid #5c2a2a', borderRadius: 10, padding: 14, color: '#ff9a9a', fontSize: 14, marginBottom: 12 }}>
+                {errMsg}
+              </div>
+              <div style={{ display: 'flex', gap: 10 }}>
+                <button className="btn btn-primary" onClick={onUnlock}>Попробовать снова</button>
+                <button className="btn btn-ghost" onClick={onCancel}>Отменить заказ</button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('app-root')).render(<App />);
+</script>
